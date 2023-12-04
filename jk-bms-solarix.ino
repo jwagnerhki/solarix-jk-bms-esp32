@@ -2,6 +2,7 @@
 //////////////////////////////////////////////////////////////////////////////
 // Board: "ESP32 Dev Module"
 // Partitioning: Huge App, No OTA
+// Device config: CPU 240 MHz WiFi+BT, Flash 80 MHz
 // Serial console 74880 baud
 //
 // JK-BMS Arduino source code adapted from original at
@@ -12,14 +13,18 @@
 //    G17 - pin 17 - GPIO17 and UART2 TXD <==> TTL/RS232 board TX in
 //    G16 - pin 16 - GPIO16 and UART2 RXD <==> TTL/RS232 board RX out
 // DB9 on TTL/rs232 board
-//    pin 5 - GND  <==> Steca pin 8   
-//    pin 3 - Tx   <==> Steca pin 2 - Rx   
+//    pin 5 - GND  <==> Steca pin 8
+//    pin 3 - Tx   <==> Steca pin 2 - Rx
 //    pin 2 - Rx   <==> Steca pin 1 - Tx
 //
 // Zettler AZ850P2-3 set-reset relay
 //    G4 - set
 //    G5 - reset
 //    GND - common ground
+// Monitors an MQTT broker, listens to topic
+//    'solar/control/inverter_enable'  value 'true'=set relay, 'false'=reset relay
+//    for example:
+//    /usr/bin/mosquitto_pub -h 192.168.0.148 -t "solar/control/inverter_enable" -m "true"
 //////////////////////////////////////////////////////////////////////////////
 
 #include <BLEDevice.h>
@@ -40,6 +45,7 @@
 
 #define GPIO_SET_ZETTLER_RELAY   4  // GPIO #4
 #define GPIO_RESET_ZETTLER_RELAY 5  // GPIO #5
+#define ZETTLER_RELAY_CONTROL_MQTT_TOPIC "solar/control/inverter_enable"
 
 const bool debug_flg = true;
 const bool debug_ble_callback = false;
@@ -49,8 +55,8 @@ const bool debug_ble_callback = false;
 const bool MQTT_ENABLE = true;
 const String mqttname = "solar";
 
-const int mqttpublishtime_period = 5000;  // millisec
-const int solarixquerytime_interval = 5000; // millisec
+const int mqttpublishtime_period = 5000;     // millisec
+const int solarixquerytime_interval = 5000;  // millisec
 
 const char mqtt_server[] = "192.168.0.74";
 const int mqtt_port = 1883;
@@ -296,9 +302,9 @@ void sendSolarixCommand(const char* cmd, size_t cmdlen)
     SolarixSerial.write((byte)(crc16 >> 8));
     SolarixSerial.write((byte)(crc16 & 0xFF));
     SolarixSerial.write('\r');
-    Serial.write(cmd, cmdlen);
-    Serial.printf("<crc16:0x%04x>", crc16);
-    Serial.println("\\r");
+    //Serial.write(cmd, cmdlen);
+    //Serial.printf("<crc16:0x%04x>", crc16);
+    //Serial.println("\\r");
 }
 
 receiveSolarixResponse_t receiveSolarixResponse(char* response, size_t* responselen)
@@ -307,22 +313,22 @@ receiveSolarixResponse_t receiveSolarixResponse(char* response, size_t* response
     
     *response = '\0';
     *responselen = 0;
-    
+
     while(SolarixSerial.available()) {
-  
+
       uint8_t ch = SolarixSerial.read();
-  
+
       if (ch == '(' && steca_rs232_response_buf_len == 0) {
         synced = true;
       }
-  
+
       //Serial.printf("rx: %c  synced: %d   buflen: %d\n", ch, synced, (int)steca_rs232_response_buf_len);
-  
+
       if (!synced) {
         steca_rs232_response_buf_len = 0;
         continue;
       }
-  
+
       if (ch == '\r') {
   
         *responselen = steca_rs232_response_buf_len - 3; // discard the starting '(' and trailing <crc16>
@@ -335,17 +341,17 @@ receiveSolarixResponse_t receiveSolarixResponse(char* response, size_t* response
         
         uint16_t own_crc16 = calcCrc16(steca_rs232_response_buf, steca_rs232_response_buf_len - 2);
         //uint16_t own_crc16 = calcCrc16(steca_rs232_response_buf+1, steca_rs232_response_buf_len - 3); // without prefixed '('
-  
+
         synced = false;
         steca_rs232_response_buf_len = 0;
-  
+
         if (crc16 != own_crc16) {
           //Serial.printf("<crc16 remote: 0x%04x> ", crc16);
           //Serial.printf("<crc16 local: 0x%04x>\n", own_crc16);
           return SOLARIX_RESPONSE_CRC_ERROR;
         }
         return SOLARIX_RESPONSE_OK;
-  
+
       } else {
         
         steca_rs232_response_buf[steca_rs232_response_buf_len] = ch;
@@ -368,34 +374,55 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
     String Command = "";
 
-    if(strcmp(topic, "inverter/enable") == 0) {
+    if(strcmp(topic, ZETTLER_RELAY_CONTROL_MQTT_TOPIC) == 0) {
         for (int i = 0; i < length; i++) {
             Command = Command + (char)payload[i];
         }
-        if(Command == "true") {
+        if(Command == "true" || Command == "on") {
             Serial.println("Enable inverter: true (on)");
             stecaPoweronRelay.set();
-        } else if(Command == "false") {
+        } else if(Command == "false" || Command == "off") {
             Serial.println("Enable inverter: false (off)");
             stecaPoweronRelay.reset();
+        } else {
+            Serial.print("Unexpected payload for MQTT topic ");
+            Serial.print(topic);
+            Serial.print(": ");
+            Serial.println(Command);
         }
     }
 }
 
 boolean mqttReconnect()
 {
-    String topic2 = mqttname + "/BLEconnection";
-    if (mqttclient.connect(mqttname.c_str(), mqtt_username, mqtt_passwort, willTopic.c_str(), willQoS, willRetain, willMessage)) {
+    String topic;
+
+    if (mqttclient.connect(/*clientId:*/ mqttname.c_str(), mqtt_username, mqtt_passwort, willTopic.c_str(), willQoS, willRetain, willMessage)) {
+        bool ok;
+
         // Once connected, publish an announcement...
-        if(millis() < 20000) {
-          mqttclient.publish(topic2.c_str(),"Startup");
+        if (millis() < 20000) {
+            topic = mqttname + "/BLEconnection";
+            ok = mqttclient.publish(topic.c_str(), "Startup");
+            if (!ok) {
+                Serial.print("Failed to publish MQTT topic ");
+                Serial.println(topic);
+            }
         }
 
-        topic2 = mqttname + "/inverter/enable";
-        mqttclient.subscribe(topic2.c_str());
+        topic = mqttname + "/status";
+        ok = mqttclient.publish(topic.c_str(), "online");
+        if (!ok) {
+            Serial.print("Failed to publish MQTT topic ");
+            Serial.println(topic);
+        }
 
-        topic2 = mqttname + "/status";
-        mqttclient.publish(topic2.c_str(),"online");
+        ok = mqttclient.subscribe(ZETTLER_RELAY_CONTROL_MQTT_TOPIC);
+        if (!ok) {
+            Serial.println("Failed to subscribe to MQTT topic " ZETTLER_RELAY_CONTROL_MQTT_TOPIC);
+            Serial.println(topic);
+        }
+
         if(debug_flg) {
           Serial.println("MQTT reconnected!");
         }
@@ -411,179 +438,186 @@ boolean mqttReconnect()
 // Build a JSON string of values and also send out MQTT topics
 void mqttPublish()
 {
-    String cellStr;
     String topic;
+    String topicvalue;
     String cellVoltageBaseTopic = mqttname + "/data/cell_";
 
-    HTML= "{\"Cell\":{";
-    for(uint8_t i=0; i<NUM_CELLS; i++) {
-        cellStr = String(jk.cellVoltage[i],3);
-        if(i<9) topic = cellVoltageBaseTopic + String("0") + String(i+1);
+    HTML = "{\"Cell\":{";
+    for (uint8_t i=0; i<NUM_CELLS; i++) {
+        topicvalue = String(jk.cellVoltage[i],3);
+        if (i < 9) topic = cellVoltageBaseTopic + String("0") + String(i+1);
         else topic = cellVoltageBaseTopic + String(i+1);
-        if(jk.cellVoltage[i] != 0) {
+        if (jk.cellVoltage[i] != 0) {
             if (MQTT_ENABLE) {
-              mqttclient.publish(topic.c_str(), cellStr.c_str());
+                mqttclient.publish(topic.c_str(), topicvalue.c_str());
             }
-          HTML = HTML + "\""  + String(i) + "\":" + cellStr.c_str();
-          if((i < NUM_CELLS-1) && (jk.cellVoltage[i+1] != 0)) {
-              HTML = HTML + ",";
-          }
+            HTML = HTML + "\"" + String(i) + "\":" + topicvalue.c_str();
+            if ((i < NUM_CELLS - 1) && (jk.cellVoltage[i + 1] != 0)) {
+                HTML = HTML + ",";
+            }
         }
     }
 
     HTML = HTML + "}," + "\"Battery\":{";
-    cellStr = String(jk.Battery_Voltage,3);
+    topicvalue = String(jk.Battery_Voltage, 3);
     topic = mqttname + "/data/Battery_Voltage";
-    if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+    if(MQTT_ENABLE) {
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Battery_Voltage\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Battery_Voltage\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.Delta_Cell_Voltage,3);
+    topicvalue = String(jk.Delta_Cell_Voltage, 3);
     topic = mqttname + "/data/Delta_Cell_Voltage";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Delta_Cell_Voltage\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Delta_Cell_Voltage\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.MOS_Temp,3);
+    topicvalue = String(jk.MOS_Temp, 3);
     topic = mqttname + "/data/MOS_Temp";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"MOS_Temp\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"MOS_Temp\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.Battery_T1,3);
+    topicvalue = String(jk.Battery_T1, 3);
     topic = mqttname + "/data/Battery_T1";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Battery_T1\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Battery_T1\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.Battery_T2,3);
+    topicvalue = String(jk.Battery_T2, 3);
     topic = mqttname + "/data/Battery_T2";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Battery_T2\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Battery_T2\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.Battery_Power,3);
+    topicvalue = String(jk.Battery_Power, 3);
     topic = mqttname + "/data/Battery_Power";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Battery_Power\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Battery_Power\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.Charge_Current,3);
+    topicvalue = String(jk.Charge_Current, 3);
     topic = mqttname + "/data/Charge_Current";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Charge_Current\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Charge_Current\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.Percent_Remain);
+    topicvalue = String(jk.Percent_Remain);
     topic = mqttname + "/data/Percent_Remain";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Percent_Remain\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Percent_Remain\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.Cycle_Count);
+    topicvalue = String(jk.Cycle_Count);
     topic = mqttname + "/data/Cycle_Count";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Cycle_Count\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Cycle_Count\":" + topicvalue.c_str() + ",";
 
     // Capacity_Remain
     // Nominal_Capacity
     // Capacity_Cycle
 
-    cellStr = String(jk.Balance_Curr,3);
+    topicvalue = String(jk.Balance_Curr, 3);
     topic = mqttname + "/data/Balance_Current";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Balance_Current\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Balance_Current\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.sec);
+    topicvalue = String(jk.sec);
     topic = mqttname + "/uptime/secs";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Uptime_Sec\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Uptime_Sec\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.mi);
+    topicvalue = String(jk.mi);
     topic = mqttname + "/uptime/mins";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Uptime_Min\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Uptime_Min\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.hr);
+    topicvalue = String(jk.hr);
     topic = mqttname + "/uptime/hours";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Uptime_Hr\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Uptime_Hr\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.days);
+    topicvalue = String(jk.days);
     topic = mqttname + "/uptime/days";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Uptime_Day\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Uptime_Day\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(jk.charge);
+    topicvalue = String(jk.charge);
     topic = mqttname + "/data/Charge";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    cellStr = String(jk.discharge);
-    HTML = HTML + "\"Charge\":\"" + cellStr.c_str() + "\",";
+    topicvalue = String(jk.discharge);
+    HTML = HTML + "\"Charge\":\"" + topicvalue.c_str() + "\",";
     topic = mqttname + "/data/Discharge";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Discharge\":\"" + cellStr.c_str() + "\",";
+    HTML = HTML + "\"Discharge\":\"" + topicvalue.c_str() + "\",";
 
     HTML += "}";
     HTML += "\"Steca\":{";
 
-    cellStr = String(solarix.load_S_VA);
+    topicvalue = String(solarix.load_S_VA);
     topic = mqttname + "/data/Steca_Load_VA";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Steca_Load_VA\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Steca_Load_VA\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(solarix.load_P_Watt);
+    topicvalue = String(solarix.load_P_Watt);
     topic = mqttname + "/data/Steca_Load_W";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Steca_Load_W\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Steca_Load_W\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(solarix.pv_P_Watt);
+    topicvalue = String(solarix.pv_P_Watt);
     topic = mqttname + "/data/Steca_MPPT_W";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Steca_MPPT_W\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Steca_MPPT_W\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(solarix.pv_V);
+    topicvalue = String(solarix.pv_V);
     topic = mqttname + "/data/Steca_MPPT_V";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Steca_MPPT_V\":" + cellStr.c_str() + ",";
+    HTML = HTML + "\"Steca_MPPT_V\":" + topicvalue.c_str() + ",";
 
-    cellStr = String(solarix.pv_I);
+    topicvalue = String(solarix.pv_I);
     topic = mqttname + "/data/Steca_MPPT_I";
     if (MQTT_ENABLE) {
-        mqttclient.publish(topic.c_str(),cellStr.c_str());
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
     }
-    HTML = HTML + "\"Steca_MPPT_I\":" + cellStr.c_str() + "}";
+    HTML = HTML + "\"Steca_MPPT_I\":" + topicvalue.c_str() + "}";
+
+    topicvalue = String(stecaPoweronRelay.isSet() ? "on" : "off");
+    topic = mqttname + "/data/inverter_relay_state";
+    if (MQTT_ENABLE) {
+        mqttclient.publish(topic.c_str(), topicvalue.c_str());
+    }
+    HTML = HTML + "\"inverter_relay_state\":" + topicvalue.c_str() + "}";
 
     HTML += "}";
 }
@@ -591,57 +625,55 @@ void mqttPublish()
 
 static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify)
 {
-    if(debug_ble_callback)
-    {
+    if (debug_ble_callback) {
         Serial.print("Notify callback for characteristic ");
         Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
         Serial.print(" of data length ");
         Serial.println(length);
         Serial.print("data: ");
-        for (int i = 0; i < length; i++)  {
-          Serial.print(pData[i],HEX);
-          Serial.print(", ");
+        for (int i = 0; i < length; i++) {
+            Serial.print(pData[i], HEX);
+            Serial.print(", ");
         }
         Serial.println("");
     }
 
     if(pData[0] == 0x55 && pData[1] == 0xAA && pData[2] == 0xEB && pData[3] == 0x90 && pData[4] == 0x02) {
-      if(debug_ble_callback) { Serial.println("Daten anerkannt !"); }
-      int newlen = length;
-      if(newlen > sizeof(receivedBytes_main)) { newlen = num_bytes; } //Prevents writing outside the array
-      received_start = true;
-      received_start_frame = true;
-      received_complete = false;
-      frame = 0;
-      for (int i = 0; i < newlen; i++)  {
-       receivedBytes_main[frame] = pData[i];
-       frame++;
-      }
+        if (debug_ble_callback) { Serial.println("BLE: received expected data pattern"); }
+        int newlen = length;
+        if (newlen > sizeof(receivedBytes_main)) { newlen = num_bytes; }  //Prevents writing outside the array
+        received_start = true;
+        received_start_frame = true;
+        received_complete = false;
+        frame = 0;
+        for (int i = 0; i < newlen; i++) {
+            receivedBytes_main[frame] = pData[i];
+            frame++;
+        }
     }
 
     if(received_start && !received_start_frame && !received_complete) {
-      if(debug_ble_callback) { Serial.println("Daten erweitert !"); }
-      int newlenadd=300-(frame+length); //Prevents writing outside the array
-      if(newlenadd>=0){newlenadd=length;} //Prevents writing outside the array
-      if(newlenadd<0){newlenadd=300-frame;} //Prevents writing outside the array
-      for (int i = 0; i < newlenadd; i++)  {
-        receivedBytes_main[frame] = pData[i];
-        frame++;
-      }
+        if(debug_ble_callback) { Serial.println("BLE: received more data"); }
+        int newlenadd = 300 - (frame + length);          //Prevents writing outside the array
+        if(newlenadd >= 0) { newlenadd = length; }      //Prevents writing outside the array
+        if(newlenadd < 0) { newlenadd = 300 - frame; }  //Prevents writing outside the array
+        for (int i = 0; i < newlenadd; i++) {
+            receivedBytes_main[frame] = pData[i];
+            frame++;
+        }
 
-      if(frame == 300) {
-        if(debug_ble_callback) { Serial.println("New Data for Analyse Complete..."); }
-        received_complete = true;
-        received_start = false;
-        new_data = true;
-        BLE_Scan_counter = 0;
-      } else if((frame > 300)) {
-        Serial.println("Fehlerhafte BMS/Bluetooth Daten !!");
-        frame = 0;
-        received_start = false;
-        new_data = false;
-      }
-
+        if(frame == 300) {
+            if (debug_ble_callback) { Serial.println("BLE: received complete data record"); }
+            received_complete = true;
+            received_start = false;
+            new_data = true;
+            BLE_Scan_counter = 0;
+        } else if ((frame > 300)) {
+            Serial.println("Fehlerhafte BMS/Bluetooth Daten !!");
+            frame = 0;
+            received_start = false;
+            new_data = false;
+        }
     }
     //Serial.print("frame: ");
     //Serial.println(frame);
@@ -706,6 +738,7 @@ void loop()
         initWiFi();
     } else {
         if (MQTT_ENABLE) {
+            mqttclient.loop();
             if (!mqttclient.connected()) {
                 if ((millis() - lastReconnectAttempt) > 5000) { // reconnect nach 5 sekunden
                     if(debug_flg) {
@@ -722,8 +755,6 @@ void loop()
                         }
                     }
                 }
-            } else {
-              mqttclient.loop();
             }
         }
     }
@@ -733,8 +764,8 @@ void loop()
         if(!connectToBLEServer()) {
             Serial.println(F("We have failed to connect to the server; there is nothin more we will do."));
             String topic = mqttname + "/BLEconnection";
-            if (MQTT_ENABLE) {
-                mqttclient.publish(topic.c_str(),"BLE_Connection_error!");
+            if(MQTT_ENABLE) {
+                mqttclient.publish(topic.c_str(), "BLE_Connection_error!");
             }
             delay(500);
             ble_connected = false;
@@ -749,9 +780,9 @@ void loop()
             //      Serial.print(receivedBytes_main[i],HEX);
             //     Serial.print(", ");
         }
-        
+
         bool do_publish_data = (mqttpublishtime == 0 || (millis() >= (mqttpublishtime + mqttpublishtime_interval)));
-        
+
         if(new_data) {
             decodeBMSData(receivedBytes_main, &jk);
             newdatalasttime = millis();
@@ -774,8 +805,8 @@ void loop()
     // JK-BMS Query Dispatch
     if(((millis() - sendingtime) > 500) && sendingtime != 0) {
         sendingtime = 0;
-        Serial.println("gesendet!");
         pRemoteCharacteristic->writeValue(getInfo, sizeof(getInfo));
+        Serial.println("Sent JK-BMS Query");
     }
 
 
@@ -801,8 +832,8 @@ void loop()
         pBLEClient->disconnect();
     }
 
-    //checker das nach max 5 Minuten und keiner BLE Verbidung neu gestartet wird...
-    if(BLE_Scan_counter > 20) {
+    // If over 5 mins of no BLE connection, reboot.
+    if (BLE_Scan_counter > 20) {
         String topic = mqttname + "/BLEconnection";
         mqttclient.publish(topic.c_str(),"Rebooting");
         delay(200);
@@ -848,7 +879,5 @@ void loop()
     }
     
     httpserver.handleClient();
-
-    stecaPoweronRelay.loop();
 }
 // end loop
